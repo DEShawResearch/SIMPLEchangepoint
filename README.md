@@ -1,5 +1,3 @@
 SIMPLEchangepoint
 =================
 
-Testing ...
-
