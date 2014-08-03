@@ -1,0 +1,515 @@
+#!/usr/bin/env SED_REPLACES_THIS
+
+# Copyright 2012-2014, D. E. Shaw Research.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# * Redistributions of source code must retain the above copyright
+#   notice, this list of conditions, and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions, and the following disclaimer in
+#   the documentation and/or other materials provided with the
+#   distribution.
+#
+# * Neither the name of D. E. Shaw Research nor the names of its
+#   contributors may be used to endorse or promote products derived
+#   from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+'''
+detect_changed_distances structure-file trajectory-file atomsel-A [options]
+
+
+This executable computes distances between selected pairs of atoms in
+a trajectory and finds changepoints in them; the changepoints can be
+analyzed or visualized using the analyze_changed_distances Python
+module.
+
+A system, trajectory, and one or two set of atoms (atomsels) to
+analyze are required. If two atomsels are provided, distances are
+taken between pairs of one atom from each selection. Otherwise,
+distances are taken between pairs of atoms in the single selection.
+
+Two distinct modes of analysis are available and are selected by the
+'analysis-mode' option:
+
+    Under the default option 'ALL', all pairwise distances are
+    analyzed. For this mode, it is recommended that atomsel-A and
+    atomsel-B select one atom per residue; these can be alpha carbons
+    or a single representative sidechain atom per residue for
+    proteins. This mode of analysis is designed to summarize
+    large-scale structural changes in proteins such as fast-folding
+    protein domains and BPTI.
+
+    Under analysis-mode 'CONTACTS', only pairs of atoms from distinct
+    residues that come within 4 Angstroms during the trajectory are
+    analyzed. It is recommended that the user select all (or a
+    representative few) heavy atoms per residue of interest in
+    atomsel-A and atomsel-B.  This mode of analysis is designed to
+    identify important changes in sidechain contacts.
+
+Changepoint analysis is written to a directory 'workdir', which should
+be placed on a filesystem with high storage capacity. Analyses for
+related trajectories, e.g. of the same or similar chemical systems,
+may be placed in the same workdir. Within a workdir, analyses are
+identified by their 'identifier' labels. Once used, an identifier
+label corresponds to certain arguments, including the trajectory,
+frame selection, atom selections, and mode of analysis.  These
+parameters must be specified for the first run of this program with a
+new identifier, during which they and the computed distance time
+series are saved to disk.  Subsequent runs with the same workdir and
+identifier but with new lambdas (see below) are allowed, but they will
+reuse these stored data preferentially.
+
+The sensitivity of the analysis is controlled by a parameter lambda in
+the changepoint algorithm. Smaller values of lambda will result in
+more detected changes.  The time-scale of detected changes is
+undefined, but for a given set of time series is proportional to
+lambda.
+
+The default behavior is to analyze about 1000 frames.  The user may
+wish to specify a finer stride depending on the trajectory and the
+desired level of analysis sensitivity. For reasonable performance, the
+total number of selected frames should not exceed ~100000 for an
+analysis with a small number (~500) of distance time series or ~10000
+for an analysis with a large number (~10000) of distance time
+series.
+
+Examples:
+
+    mpiexec -n 4 detect_changed_distances small_protein.mae small_protein.dcd 'name CA' --parallel --workdir=all_pairs --analysis-mode='ALL'
+
+    mpiexec -n 4 detect_changed_distances large_protein.mae large_protein.dcd 'noh' --parallel --workdir=contacts --analysis-mode='CONTACTS'
+    
+'''
+
+import molfile
+import msys
+import periodicfix
+import tables
+import numpy as np
+import cPickle
+import os
+import sys
+import SIMPLEchangepoint
+import SIMPLEchangepoint._univariate_changes
+import argparse
+import time
+from collections import defaultdict
+
+def compute_distances(workdir, identifier, structure_file, trajectory_file,
+        atomsel_A, atomsel_B, first_frame, last_frame, stride, contact_dist, 
+        include_symmetric_atoms, atom_groups_file, alpha, beta, parallel):
+    if parallel:
+        from mpi4py import MPI
+        world = MPI.COMM_WORLD
+        world_size = world.Get_size()
+        world_rank = world.Get_rank()
+    else:
+        world_size = 1
+        world_rank = 0
+    if world_rank == 0:
+        print '...loading structure and trajectory'
+    # Read structure and get atoms in selections
+    mol = msys.Load(structure_file)
+    atoms_A = mol.select(atomsel_A)
+    if atomsel_B is not None:
+        atoms_B = mol.select(atomsel_B)
+        atoms = atoms_A + atoms_B
+    else:
+        atoms_B = atoms_A
+        atoms = atoms_A
+    # Read trajectory
+    if first_frame is None or first_frame < 0:
+        first_frame = 0
+    if trajectory_file[-4:] == '.dcd':
+        r = molfile.dcd.read(trajectory_file)
+        if world_rank == 0: print '...counting frames in dcd'
+        nframes = sum([1 for f in r.frames()]) # full dcd needn't fit in RAM
+        if last_frame is None or last_frame >= nframes:
+            last_frame = nframes
+        else:
+            last_frame += 1
+        if stride is None or stride <= 0:
+            stride = max(1, (last_frame - first_frame) / 1000) # will analyze [first_frame, last_frame) with stride 
+            if world_rank == 0: print 'Default: chose stride %d to analyze %d/%d frames' % (stride, 1+(last_frame-first_frame-1)/stride, nframes)
+        i = 0
+        trj = []
+        for f in r.frames():
+            if i == last_frame:
+                break
+            if i >= first_frame and (i-first_frame)%stride == 0:
+                trj.append(f)
+            i += 1
+        if world_rank == 0 and len(trj) > 300000:
+            print 'WARNING: This analysis contains %d frames and may abort in a memory overflow. You may want to consider using a coarser stride.' % len(trj)
+        frame_inds = range(first_frame, last_frame, stride)
+    elif trajectory_file[-4:] == '.dtr' or trajectory_file[-4:] == '.stk':
+        reader = molfile.dtr.read(trajectory_file)
+        if last_frame is None or last_frame >= reader.nframes:
+            last_frame = reader.nframes
+        else:
+            last_frame += 1
+        if stride is None or stride <= 0:
+            stride = max(1, (last_frame - first_frame) / 1000)
+            if world_rank == 0: print 'Default: chose stride %d to analyze %d/%d frames' % (stride, 1+(last_frame-first_frame)/stride, reader.nframes)
+        frame_inds = range(first_frame, last_frame, stride)
+        if world_rank == 0 and len(frame_inds) > 300000:
+            print 'WARNING: This analysis contains %d frames and may abort in a memory overflow. You may want to consider using a coarser stride.' % len(frame_inds)
+        trj = [reader.frame(f) for f in frame_inds]
+    else:
+        raise RuntimeError, 'Trajectory file must be of format *.dcd, *.dtr, or *.stk'
+    if len(trj) <= 1:
+        raise RuntimeError, 'Must specify at least 2 frames'
+
+    itop = []
+    ptoi = {}
+    if world_rank == 0:
+        # Compute symmetric atoms
+        top_ids = msys.ComputeTopologicalIds(mol)
+        symmetric = dict([(a.id, [a.id]) for a in atoms])
+        if not include_symmetric_atoms:
+            print '...determining symmetric atoms'
+            atoms_by_residue = defaultdict(lambda: defaultdict(set))
+            for a in atoms:
+                atoms_by_residue[a.residue][a.atomic_number].add(a)
+            for res, elements in atoms_by_residue.items():
+                for element, res_atoms in elements.items():
+                    res_atoms = list(res_atoms)
+                    for i in range(len(res_atoms)):
+                        for j in range(i+1, len(res_atoms)):
+                            if top_ids[res_atoms[i].id] == top_ids[res_atoms[j].id]:
+                                symmetric[res_atoms[i].id].append(res_atoms[j].id)
+                                symmetric[res_atoms[j].id].append(res_atoms[i].id)
+        symmetric = dict([(k, tuple(sorted(v))) for k,v in symmetric.items()])
+        
+        # Determine contact pairs
+        if contact_dist > 0:
+            print '...finding all atom pairs in contact in a sample of 50 evenly-spaced frames'
+            contact_pairs = set()
+            atom_ids = [a.id for a in atoms]
+            for f in np.arange(0, len(trj), len(trj) / 50.0):
+                if int(f) == len(trj):
+                    continue
+                contacts = periodicfix.find_contacts(contact_dist, trj[int(f)].pos,
+                        atom_ids)
+                contact_pairs.update([tuple(pair) for pair in contacts])
+                
+        # Determine time series
+        print '...determining all time series observables'
+        a_ids = [a.id for a in atoms_A]
+        b_ids = [a.id for a in atoms_B]
+        a_res_ids = [a.residue.id for a in atoms_A]
+        b_res_ids = [a.residue.id for a in atoms_B]
+        for (a, res_a) in zip(a_ids, a_res_ids):
+            for (b, res_b) in zip(b_ids, b_res_ids):
+                if symmetric[a] == symmetric[b]:
+                    continue
+                if contact_dist > 0 and res_a == res_b:
+                    continue
+                if contact_dist > 0 and (a,b) not in contact_pairs \
+                        and (b,a) not in contact_pairs:
+                    continue
+                if symmetric[a] < symmetric[b]:
+                    p = (symmetric[a], symmetric[b])
+                else:
+                    p = (symmetric[b], symmetric[a])
+                if p in ptoi:
+                    continue
+                itop.append(p)
+                ptoi[p] = len(itop) - 1
+        if len(itop) > 300000:
+            print 'WARNING: This analysis contains %d time series and may abort in a memory overflow. (Did you intend to set --analysis-mode=CONTACTS?)' % len(itop)
+        print '...total of %d time series of length %d frames' % (len(itop), len(trj))
+        if contact_dist > 0:
+            del contact_pairs
+    if parallel:
+        itop = world.bcast(itop, 0)
+        ptoi = world.bcast(ptoi, 0)
+
+    # Compute pairwise distances in parallel
+    if world_rank == 0:
+        print '...computing distances'
+    my_nframes = (len(trj) - 1) / world_size + 1
+    my_trj = trj[(world_rank*my_nframes) : ((world_rank+1)*my_nframes)]
+    if len(my_trj) > 0:
+        pos = np.array([f.pos for f in my_trj])
+        dists = np.zeros((len(itop), len(my_trj)), dtype='float32')
+        dists.fill(np.inf)
+        for i, p in enumerate(itop):
+            for a in p[0]:
+                for b in p[1]:
+                    d = np.sqrt(np.sum((pos[:,a,:] -
+                        pos[:,b,:])**2, axis=1))
+                    dists[i,:] = np.minimum(dists[i,:], d)
+            if contact_dist > 0:
+                # Sigmoid transform
+                dists[i,:] = 1.0 / (1.0 + (contact_dist / dists[i,:]) ** 5)
+        del pos
+    else:
+        dists = np.zeros((len(itop), 0), dtype='float32')
+
+    # Write distances to disk
+    if world_rank == 0:
+        print '...writing data to HDF5 array on disk'
+        filename = os.path.join(workdir, identifier, 'data.h5')
+        if os.path.exists(filename):
+            os.remove(filename)
+        h5out = tables.openFile(filename, 'w')
+        data_array = h5out.createCArray(h5out.root, 'data',
+                tables.Float32Atom(), (dists.shape[0], len(trj)),
+                chunkshape=(1, len(trj)))
+    # Split gather and write into separate chunks of rows
+    nrows = max(10000000 / (len(trj) * 4), 1)
+    np.random.seed(0)
+    for i in range(0, dists.shape[0], nrows):
+        if parallel:
+            all_data = world.gather(dists[i:(i+nrows),:], 0)
+        else:
+            all_data = [dists[i:(i+nrows),:]]
+        if world_rank == 0:
+            data = np.concatenate(all_data, axis=1)
+            if contact_dist > 0:  # Add noise
+                data += np.random.uniform(0.0, 0.1, size=data.shape)
+            data_array[i:(i+nrows),:] = data
+    if world_rank == 0:
+        h5out.close()
+
+    if parallel:
+        len_trj = world.gather(len(my_trj), 0)
+    else:
+        len_trj = [len(my_trj)]
+    if world_rank == 0:
+        # Compute observable groups
+        print '...computing time series groups'
+        group_ids = {}
+        if atom_groups_file is not None:
+            file = open(atom_groups_file, 'r')
+            atom_groups = cPickle.load(file)
+            file.close()
+            atom_group_sets = [set(group) for group in atom_groups]
+            disjoint_groups = True
+            for i in range(len(atom_group_sets)):
+                for j in range(i+1, len(atom_group_sets)):
+                    if len(atom_group_sets[i] & atom_group_sets[j]) > 0:
+                        disjoint_groups = False
+                        break
+                if not disjoint_groups:
+                    break
+        else:
+            atoms_by_res = defaultdict(list)
+            for a in set(atoms):
+                resid = a.residue.resid
+                chain = a.residue.chain.name
+                atoms_by_res[(chain, resid)].append(a.id)
+            if contact_dist == 0:
+                atom_groups = defaultdict(list)
+                for k, v in atoms_by_res.items():
+                    for r in range(k[1]-2, k[1]+3):
+                        if (k[0], r) in atoms_by_res:
+                            atom_groups[(k[0], r)].extend(v)
+                atom_groups = [v for k,v in atom_groups.items()]
+                disjoint_groups = False
+            else:
+                atom_groups = [v for k,v in atoms_by_res.items()]
+                disjoint_groups = True
+        groups = []
+        for i in range(len(atom_groups)):
+            for j in range(i, len(atom_groups)):
+                group = set()
+                for a in atom_groups[i]:
+                    for b in atom_groups[j]:
+                        sa = symmetric[a]
+                        sb = symmetric[b]
+                        if sa < sb and (sa, sb) in ptoi and \
+                                ptoi[(sa,sb)] not in group:
+                            group.add(ptoi[(sa,sb)])
+                        if sb < sa and (sb, sa) in ptoi and \
+                                ptoi[(sb,sa)] not in group:
+                            group.add(ptoi[(sb,sa)])
+                if len(group) > 0:
+                    groups.append(group)
+        print "...writing 'data_info.pkl'"
+        file = open(os.path.join(workdir, identifier, 'data_info.pkl'), 'w')
+        if beta is None:
+            beta = 0.7
+        if alpha is None:
+            if contact_dist > 0:
+                alpha = 0.99
+            else:
+                alpha = 0.7
+        cPickle.dump({'structure_file': os.path.abspath(structure_file),
+            'trajectory_file': os.path.abspath(trajectory_file),
+            'first_frame' : first_frame,
+            'last_frame' : last_frame,
+            'stride' : stride,
+            'atomsel_A': atomsel_A,
+            'atomsel_B': atomsel_B,
+            'frame_inds': frame_inds,
+            'contact_dist': contact_dist,
+            'index_to_pair': itop,
+            'pair_to_index': ptoi,
+            'include_symmetric_atoms': include_symmetric_atoms,
+            'symmetric_atoms': symmetric,
+            'groups': groups,
+            'alpha': alpha,
+            'beta': beta,
+            'disjoint_groups': disjoint_groups}, file)
+        file.close()
+
+
+def detect_changed_distances(workdir, identifier, lambda_start, max_change_times,
+        lambda_scale, parallel, structure_file, trajectory_file, atomsel_A,
+        atomsel_B, first_frame, last_frame, stride, analysis_mode,
+        include_symmetric_atoms, atom_groups_file, alpha, beta, has_options):
+    if parallel:
+        from mpi4py import MPI
+        world = MPI.COMM_WORLD
+        world_rank = world.Get_rank()
+    else:
+        world_rank = 0
+    if world_rank == 0:
+        if identifier == None:
+            num = 1
+            while os.path.exists(os.path.join(workdir, str(num))):
+                num += 1
+            identifier = str(num)
+            print 'Choosing unused identifier %s by default' % identifier
+        print 'Beginning changepoint detection for workdir %s, identifier %s' % (workdir, identifier)
+    if parallel:
+        identifier = world.bcast(identifier, 0)
+    h5_path = os.path.join(workdir, identifier, 'data.h5')
+    info_path = os.path.join(workdir, identifier, 'data_info.pkl')
+    if not os.path.exists(info_path) or not os.path.exists(h5_path):
+        if parallel:
+            world.allgather(None)
+        if world_rank == 0:
+            print "Previous run not found---computing new distance time series"
+        if structure_file is None or trajectory_file is None \
+                or atomsel_A is None:
+            raise RuntimeError, 'Must specify structure-file, trajectory-file, and atomsel-A'
+        if analysis_mode.lower() == 'all':
+            contact_dist = 0
+        elif analysis_mode.lower() == 'contacts':
+            contact_dist = 4
+        else:
+            raise RuntimeError, 'analysis-mode must be ALL or CONTACTS'
+        nondir = False
+        if world_rank == 0:
+            if not os.path.isdir(os.path.join(workdir, identifier)):
+                if os.path.exists(os.path.join(workdir, identifier)):
+                    nondir = True
+                else:
+                    os.makedirs(os.path.join(workdir, identifier))
+        if parallel:
+            nondir = world.bcast(nondir, 0)
+        if nondir:
+            raise RuntimeError, "Path '%s' exists but is not a directory" % os.path.join(workdir, identifier)
+        if parallel:
+            world.allgather(None)
+        compute_distances(workdir, identifier, structure_file, trajectory_file,
+                atomsel_A, atomsel_B, first_frame, last_frame, stride,
+                contact_dist, include_symmetric_atoms, atom_groups_file, alpha,
+                beta, parallel)
+    elif has_options:
+        if world_rank == 0:
+            print >> sys.stderr, "WARNING: Previous run was found for this identifier; ignoring new option specifications"
+    if parallel:
+        world.allgather(None)
+    while not os.access(h5_path, os.R_OK) or not os.access(info_path, os.R_OK):
+        time.sleep(5)
+    h5 = tables.openFile(os.path.join(workdir, identifier, 'data.h5'), 'r')
+    file = open(os.path.join(workdir, identifier, 'data_info.pkl'), 'r')
+    info = cPickle.load(file)
+    file.close()
+    groups = info['groups']
+    alpha = info['alpha']
+    beta = info['beta']
+    disjoint_groups = info['disjoint_groups']
+    last = -1
+    if lambda_start == None:
+        J, T = h5.root.data.shape
+        target = J * (np.log(T)**2) / 1000
+        lambda_start = 2**(1.0 + int(np.log(target)/np.log(2)))
+        if world_rank == 0:
+            print 'Choosing lambda_start = %g by default' % lambda_start
+    lam = lambda_start
+    while last < max_change_times and round(lam, 4) > 0:
+        if world_rank == 0:
+            print 'Computing changes for lambda = ' + str(round(lam, 4))
+        changes = SIMPLEchangepoint.ComputeChanges(h5.root.data, round(lam, 4), alpha=alpha, groups=groups, beta=beta, parallel=parallel)
+        converted_changes = {}
+        for t, v in changes.items():
+            converted_changes[info['frame_inds'][t]] = set([info['index_to_pair'][i] for i in v])            
+        if world_rank == 0 and len(converted_changes) > 0:
+            print 'Total %d change times, %d changes' % (len(converted_changes),
+                    sum([len(v) for k,v in converted_changes.items()]))
+            chg_file = str(round(lam, 4)) + '.chg'
+            print "Saving changes to file '%s'" % chg_file
+            chg_file = os.path.join(workdir, identifier, chg_file)
+            cPickle.dump(converted_changes, open(chg_file, 'w'))
+        last = len(converted_changes)
+        lam *= lambda_scale
+    h5.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(usage=__doc__)
+    
+    # arguments
+    parser.add_argument('structure-file', help='input structure file (mae or dms)')
+    parser.add_argument('trajectory-file', help='input trajectory file (stk or dcd)')
+    parser.add_argument('atomsel-A', help='selection to analyze (msys atomsel)')
+    
+    # options
+    parser.add_argument('--analysis-mode',    default='ALL', type=str,              help="specify 'ALL' or 'CONTACTS' [default:  'ALL']")
+    parser.add_argument('--workdir',          default="changepoint",                help='directory to store output; [default:  changepoint]')
+    # FIXME identifier used to be mandatory
+    parser.add_argument('--identifier',                                             help='string identifier for current analysis [default:  lowest unused natural number]')
+    parser.add_argument('--lambda-start', dest='lambda_start',  type=float,         help='starting value for lambda (sensitivity parameter) [default:  power of 2 just above Jlog(T)^2/1000]')
+    parser.add_argument('--lambda-scale', dest='lambda_scale', default=0.5,   type=float, nargs='?', help='repeat analysis scaling lambda by this factor each time [default:  0.5]')
+    parser.add_argument('--max-change-times', dest='max_change_times', default=0,     type=int,   nargs='?', help="repeat analysis with decreasing lambdas until at least this many change times are detected [default:  0 (don't repeat)]") # TODO: what does nargs='?' mean
+    parser.add_argument('--parallel', action='store_true', help='run in parallel using MPI and mpi4py')
+   
+    # setup trajectory
+    #parser.add_argument('--aggregates', nargs='+', default=[], help='aggregates for gluing trajectory [default:  no aggregates]')
+    parser.add_argument('--first-frame', type=int, help='first frame to analyze [default:  0, beginning]')
+    parser.add_argument('--last-frame', type=int, help='last frame to analyze  [default:  last frame]')
+    parser.add_argument('--stride', type=int, help='stride length in number of frames [default:  select about 1000 total frames]')
+    #parser.add_argument('--without-refine-times', action='store_true', help='do not refine change times with stride of 1 frame')
+    
+    # customize traces
+    parser.add_argument('--atomsel-B', help='second atom selection; if given, analyze pairs from the direct product atomsel-A x atomsel-B [default:  None]')
+    parser.add_argument('--include-symmetric-atoms', action='store_true', help='do not reduce groups of distances based on symmetry-related atoms (e.g. methyl hydrogens) into single time series [default: use minimum distance]')
+    
+    # customize likelihood
+    parser.add_argument('--atom-groups-file', help='atom grouping specification as a cPickled list of atom ID lists [default:  group by five surrounding residues]')
+    parser.add_argument('--beta', type=float, help='beta (within-group exponent) parameter [default:  0.7]')
+    parser.add_argument('--alpha', type=float, help='alpha (between-group exponent) parameter [default:  0.99 if --analysis-mode=CONTACTS or 0.7 if --analysis-mode=ALL]')
+    args = parser.parse_args()
+    has_options = False
+    for arg in sys.argv:
+        if arg[:2] == '--' and arg != '--parallel':
+            has_options = True
+    args = vars(args)
+    args['has_options'] = has_options
+    args['atomsel_A'] = args.pop('atomsel-A') # '--atomsel-A' => 'atomsel_A' but 'atomsel-A' => 'atomsel-A'
+    args['structure_file'] = args.pop('structure-file')
+    args['trajectory_file'] = args.pop('trajectory-file')
+    detect_changed_distances(**args)
+
+# vim: filetype=python

@@ -1,0 +1,86 @@
+Import('env')
+Import('libmsys')
+
+env=env.Clone()
+env.Prepend(CPPPATH=['../src'], LIBS=['msys'])
+
+opts=Variables()
+opts.Add("MSYS_WITHOUT_PSFGEN", "without psfgen?")
+opts.Update(env)
+
+# Take this out to avoid needing Eigen
+## atommatch
+#obj=env.AddObject('atommatch/atommatch.cxx')
+#env.AddUnitTest('test_atommatch', [obj]+['atommatch/test_atommatch.cxx'])
+#pyext=env.AddPythonExtension('_atommatch', [obj]+['atommatch/pymod.cxx'], prefix='msys', LIBS=['boost_python', 'msys'])
+#env.Requires(pyext, libmsys)
+#env.AddPythonModule('atommatch/atommatch.py', prefix='msys')
+#env.AddScript('dms-atommatch', src='atommatch/dms-atommatch')
+## Make sure we don't use any of the non-permissive features of Eigen.
+#env.Append(CCFLAGS='-DEIGEN_MPL2_ONLY')
+
+# converters
+env.AddProgram('mae2dms', 'converters/mae2dms.cxx')
+env.AddProgram('dms2mae', 'converters/dms2mae.cxx')
+env.AddProgram('msys2mol2', 'converters/msys2mol2.cxx')
+
+## fep
+env.AddScript('fep/dms-uncharge')
+env.AddProgram('dms-alchemical', 'fep/dms-alchemical.cxx')
+
+## grease
+env.AddPythonModule('grease/grease.py', prefix='msys')
+env.AddScript('grease/dms-grease')
+
+## psfgen
+if not env.get("MSYS_WITHOUT_PSFGEN"):
+    psfenv=env.Clone()
+    psfenv.Append(
+            CPPDEFINES=['PSFGEN_USEPLUGINS'],
+            LIBS=['molfile'],
+            )
+    psfenv.AddLibrary('psfgen', Glob('psfgen/src/*.c'))
+    psfenv.AddPythonModule('psfgen/psfgen.py', prefix='msys')
+
+## posre
+env.AddPythonModule('posre/posre.py', prefix='msys')
+env.AddScript('posre/dms-posre')
+
+# thermalize
+env.AddPythonModule('thermalize/thermalize.py', prefix='msys')
+env.AddScript('thermalize/dms-thermalize')
+
+# validate
+env.AddPythonModule('validate/validate.py', prefix='msys')
+env.AddPythonModule('validate/knot.py', prefix='msys')
+env.AddScript('validate/dms-validate')
+env.AddScript('validate/dms-find-knot')
+
+# info
+env.AddProgram('dms-version', ['info/dms-version.cxx'])
+env.AddScript('info/dms-diff')
+env.AddScript('info/dms-dump')
+env.AddScript('info/dms-inchi')
+env.AddScript('info/dms-info')
+env.AddScript('info/dms-sequence')
+env.AddPythonModule('info/inchi.py', prefix='msys')
+env.AddPythonModule('info/sequence.py', prefix='msys')
+
+# vdw
+env.AddPythonModule('vdw/vdw.py', prefix='msys')
+env.AddScript('vdw/dms-override-vdw')
+env.AddScript('vdw/dms-scale-vdw')
+
+# other scripts
+env.AddScript('scripts/dms-check-groups')
+env.AddScript('scripts/dms-fix-mass')
+env.AddScript('scripts/dms-frame')
+env.AddScript('scripts/dms-reorder-atoms')
+env.AddScript('scripts/dms-select')
+env.AddScript('scripts/dms-set')
+env.AddScript('scripts/dms-tile')
+env.AddScript('scripts/dms-replicate')
+env.AddPythonModule('scripts/update.py', prefix='msys')
+env.AddPythonModule('scripts/wrap.py', prefix='msys')
+env.AddPythonModule('scripts/reorder.py', prefix='msys')
+

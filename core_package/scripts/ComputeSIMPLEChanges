@@ -1,0 +1,97 @@
+#!/usr/bin/env python
+
+# Copyright 2012-2014, D. E. Shaw Research.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# * Redistributions of source code must retain the above copyright
+#   notice, this list of conditions, and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions, and the following disclaimer in
+#   the documentation and/or other materials provided with the
+#   distribution.
+#
+# * Neither the name of D. E. Shaw Research nor the names of its
+#   contributors may be used to endorse or promote products derived
+#   from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+'''
+ComputeSIMPLEChanges data-file output-changes-file [--lambda] [ options ]
+
+Detects simultaneous change-points in multiple time series or other
+sequential data.
+
+Fits a model in which data in each segment between change-points for each
+time series is iid Laplace distributed, and these segments are independent.
+Selects the model and change-points by maximizing the log-likelihood of
+the data, subject to a penalty for each change time equal to
+
+    p(S) = lambda*(sum_{G in groups} |S intersect G|^beta)^alpha,
+
+where S is the set of changed time series at that time.
+
+data-file -- cPickle file of a 2-dimensional (J x T) numpy array, where
+    J is the number of time series observables and T is the length of each
+    time series, or an HDF5 data file (with file-extension .h5) containing
+    a 2-dimensional (J x T) CArray or EArray at hdf5.root.data. For optimal
+    performance, array should be of type 'float32' and C-contiguous, and
+    chunk shape should be (1 x T) for HDF5 arrays.
+
+output-changes-file -- cPickle file of a Python dictionary
+    { int: set(int, ..., int), ..., int: set(int, ..., int) }, where a key of
+    t indicates a change time between data points t-1 and t, and the set
+    value for that key indicates the time series (a subset of {0,...,J-1})
+    that change at that time.
+'''
+
+import argparse
+import SIMPLEchangepoint
+import cPickle
+
+parser = argparse.ArgumentParser(usage=__doc__)
+parser.add_argument('data-file')
+parser.add_argument('output-changes-file')
+parser.add_argument('--lambda', default=None, type=float, help='Positive real-valued sensitivity parameter. Set lambda higher to detect fewer changes, and lower to detect more changes. DEFAULT:  a power of 2 near J*(log T)^2/1000.')
+parser.add_argument('--alpha', type=float, default=0.7, help='Parameter in (0,1]. Set alpha closer to 0 to increase the tendency of detecting changes in different time series as simultaneous, and closer to 1 to decrease this tendency. DEFAULT: 0.7')
+parser.add_argument('--groups.pkl', default='', help='cPickle file of a Python list of (not necessarily disjoint) subsets of time series, in the format [ set(int, ..., int), ..., set(int, ..., int) ] where each set specifies indices in the range 0, ..., J-1. Changes will have a greater tendency of being detected as simultaneous for time series within the same groups. DEFAULT: [ set(1, ..., J) ])')
+parser.add_argument('--beta', type=float, default=1.0, help='Parameter in (0,1]. Set beta closer to 0 to increase the tendency of detecting changes within the same groups as simultaneous, and closer to 1 to decrease this tendency. DEFAULT: 1.0')
+parser.add_argument('--lambda-min', default=8.0, type=float, help='Minimum lambda to use during the first pass. DEFAULT: 8.0.')
+parser.add_argument('--verbose', action='store_true', help='Print algorithm progress to screen.')
+parser.add_argument('--parallel', action='store_true', help='Allow parallel execution on multiple nodes using MPI.')
+parser.add_argument('--maxiters', type=int, default=100, help='Maximum number of iterations for which to run algorithm. DEFAULT: 100')
+args = vars(parser.parse_args())
+
+if args['data-file'][-3:] == '.h5':
+    import tables
+    h5 = tables.openFile(args['data-file'])
+    data = h5.root.data
+else:
+    data = cPickle.load(open(args['data-file']))
+if args['groups.pkl'] != '':
+    groups = cPickle.load(open(args['groups.pkl']))
+else:
+    groups = None
+changes = SIMPLEchangepoint.ComputeChanges(data, args['lambda'],
+        lam_min=args['lambda_min'],
+        alpha=args['alpha'], groups=groups, beta=args['beta'],
+        verbose=args['verbose'], parallel=args['parallel'],
+        max_iters=args['maxiters'])
+cPickle.dump(changes, open(args['output-changes-file'], 'w'))
+if args['data-file'][-3:] == '.h5':
+    h5.close()
