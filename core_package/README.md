@@ -29,8 +29,8 @@ simply run the install script to install to a path of your choice:
     $ ./install.sh -p PREFIX
 
 where PREFIX should be replaced by the path to your preferred Python
-installation directory.  Note also that it might be necessary to adjust the
-paths set in the file config.sh depending on your local environment.
+installation directory.  Note also that it might be necessary to adjust
+values set in the file config.sh depending on your local environment.
 
 After running the installation script, be sure to update your PYTHONPATH and
 PATH environment variables to include the subdirectories of PREFIX in which
