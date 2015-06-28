@@ -29,13 +29,16 @@ simply run the install script to install to a path of your choice:
     $ ./install.sh -p PREFIX
 
 where PREFIX should be replaced by the path to your preferred Python
-installation directory.  Note also that it might be necessary to adjust
-values set in the file config.sh depending on your local environment.
+installation directory.  Note that install.sh and config.sh assume you are 
+using python2.7, and you will need to adjust these scripts if you are using
+a different version of Python.
 
 After running the installation script, be sure to update your PYTHONPATH and
 PATH environment variables to include the subdirectories of PREFIX in which
-the SIMPLEchangepoint library and the ComputeSIMPLEChanges script were
-installed.
+the SIMPLEchangepoint Python library and the ComputeSIMPLEChanges script were
+installed.  Do not launch Python from within the core_package directory
+that contains this README.md file, to ensure that SIMPLEchangepoint is
+imported from the correct installation directory in your PYTHONPATH.
 
 
 Usage
@@ -48,7 +51,8 @@ To run SIMPLE changepoint from within a Python session:
 
 where data is a 2D numpy array or pytables (HDF5) CArray or EArray,
 and lam is the lambda parameter to control the magnitude of the
-penalty function.  See Python docstrings for full details.
+penalty function.  See Python docstrings for full details, including
+how to modify the form of the penalty function.
 
 To run from a command line:
 
