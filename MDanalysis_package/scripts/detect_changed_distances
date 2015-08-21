@@ -276,7 +276,6 @@ def compute_distances(workdir, identifier, structure_file, trajectory_file,
                 chunkshape=(1, len(trj)))
     # Split gather and write into separate chunks of rows
     nrows = max(10000000 / (len(trj) * 4), 1)
-    np.random.seed(0)
     for i in range(0, dists.shape[0], nrows):
         if parallel:
             all_data = world.gather(dists[i:(i+nrows),:], 0)
@@ -285,7 +284,9 @@ def compute_distances(workdir, identifier, structure_file, trajectory_file,
         if world_rank == 0:
             data = np.concatenate(all_data, axis=1)
             if contact_dist > 0:  # Add noise
-                data += np.random.uniform(0.0, 0.1, size=data.shape)
+                for j in range(data.shape[0]):
+                    np.random.seed(i+j)
+                    data[j] += np.random.uniform(0.0, 0.1, size=(1,data.shape[1]))
             data_array[i:(i+nrows),:] = data
     if world_rank == 0:
         h5out.close()
