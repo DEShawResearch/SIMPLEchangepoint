@@ -269,17 +269,8 @@ class TrajectoryChanges(object):
         ax = fig.add_subplot(111)
         dists = self._h5.root.data[idx]
         if self._info['contact_dist'] > 0:
-            seeds = self._info['seeds']
-            for i in range(len(seeds)):
-                np.random.seed(seeds[i][0])
-                if i == 0:
-                    start = 0
-                else:
-                    start = seeds[i-1][1]
-                rands = np.random.uniform(low=0.0, high=0.1,
-                        size=(len(self._info['index_to_pair']),
-                            seeds[i][1] - start))
-                dists[start:seeds[i][1]] -= rands[idx,:]
+            np.random.seed(idx)
+            dists -= np.random.uniform(0.0,0.1,size=(1,len(dists)))
             dists = self._info['contact_dist'] / (1.0 / dists - 1) ** 0.2
         ax.plot(self._info['frame_inds'], dists, '.')
         if lam is not None:
