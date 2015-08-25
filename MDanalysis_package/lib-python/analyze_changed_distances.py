@@ -270,7 +270,7 @@ class TrajectoryChanges(object):
         dists = self._h5.root.data[idx]
         if self._info['contact_dist'] > 0:
             np.random.seed(idx)
-            dists -= np.random.uniform(0.0,0.1,size=(1,len(dists)))
+            dists -= np.random.uniform(0.0,0.1,size=len(dists))
             dists = self._info['contact_dist'] / (1.0 / dists - 1) ** 0.2
         ax.plot(self._info['frame_inds'], dists, '.')
         if lam is not None:
