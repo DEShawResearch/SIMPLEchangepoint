@@ -286,7 +286,7 @@ def compute_distances(workdir, identifier, structure_file, trajectory_file,
             if contact_dist > 0:  # Add noise
                 for j in range(data.shape[0]):
                     np.random.seed(i+j)
-                    data[j] += np.random.uniform(0.0, 0.1, size=(1,data.shape[1]))
+                    data[j] += np.random.uniform(0.0, 0.1, size=data.shape[1])
             data_array[i:(i+nrows),:] = data
     if world_rank == 0:
         h5out.close()
