@@ -1,0 +1,4 @@
+16c16
+<         CXXFLAGS='-std=c++0x -Werror',
+---
+>         CXXFLAGS='-std=c++0x',

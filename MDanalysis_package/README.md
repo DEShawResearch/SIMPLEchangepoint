@@ -5,7 +5,7 @@ A guide to the SIMultaneous Penalized Likelihood Estimate (SIMPLE) changepoint M
 
 Prerequisites
 -------------
-* [gcc] (>= 4.6.1) - The de facto free compiler of choice.
+* [gcc] (>= 4.6.1 and <= 4.7.2) - The de facto free compiler of choice.
 * [python] (2.7) - "A programming language that lets you work quickly and integrate systems more effectively."
 * [numpy] - "The fundamental package for scientific computing with Python."
 * [boost.python] - "A C++ library which enables seamless interoperability between C++ and the Python programming language."

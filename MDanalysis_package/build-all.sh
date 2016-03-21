@@ -115,7 +115,7 @@ LDFLAGS=""
 CPPFLAGS=""
 
 # Set up Python for DESRES-style scons build and unit-testing
-PYTHONPATH=$PWD/sconsutils:$PYTHONPATH
+export PYTHONPATH=$PWD/sconsutils:$PYTHONPATH
 
 # Build molfile
 tar -xf molfile-1.10.15-src.tar.gz
@@ -143,6 +143,7 @@ cp -f sconsutils/msys_SConscript msys-1.7.52/SConscript # clobber!
 cp -f sconsutils/msys_tools_SConscript msys-1.7.52/tools/SConscript # clobber!
 cp -f sconsutils/msys_tests_ut.py msys-1.7.52/tests/ut.py # clobber!
 patch msys-1.7.52/src/analyze/bond_orders.cxx < patches/msys_bond_orders.patch
+patch msys-1.7.52/SConscript < patches/msys_SConscript.patch
 pushd msys-1.7.52
 
 DESRES_MODULE_CPPFLAGS="$IBOOST:$IPYTHON:$INUMPY:$ISQLITE:$ILPSOLVE:-I${PREFIX}/include"
